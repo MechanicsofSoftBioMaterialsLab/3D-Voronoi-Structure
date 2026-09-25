@@ -1,0 +1,694 @@
+from tqdm import tqdm
+import torch, os, time, cv2, natsort, random, sys
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms as T
+from torchvision.utils import save_image, make_grid
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+import pandas as pd
+# ---- robust (un)compiled checkpoint I/O ----
+def _strip_num_batches(sd: dict) -> dict:
+    return {k: v for k, v in sd.items() if not k.endswith("num_batches_tracked")}
+
+def _remap_compiled_keys(sd: dict) -> dict:
+    # remove any "._orig_mod." introduced by torch.compile
+    new = {}
+    for k, v in sd.items():
+        nk = k.replace("nn_model._orig_mod.", "nn_model.")
+        nk = nk.replace("._orig_mod.", ".")
+        new[nk] = v
+    return new
+
+def smart_load_ddpm(ddpm, ckpt_path, map_location="cpu", strict=True):
+    sd = torch.load(ckpt_path, map_location=map_location)
+    try:
+        ddpm.load_state_dict(sd, strict=strict)
+        return
+    except RuntimeError:
+        # try again after remapping compiled keys and dropping BN trackers
+        sd2 = _strip_num_batches(_remap_compiled_keys(sd))
+        ddpm.load_state_dict(sd2, strict=False)
+
+def save_ddpm_unwrapped(ddpm, path: str):
+    """
+    Save a state_dict without compile wrappers so it loads on both
+    compiled & uncompiled models.
+    """
+    if hasattr(ddpm.nn_model, "_orig_mod"):
+        # temporarily unwrap to get clean keys
+        wrapped = ddpm.nn_model
+        ddpm.nn_model = wrapped._orig_mod
+        sd = ddpm.state_dict()
+        ddpm.nn_model = wrapped
+    else:
+        sd = ddpm.state_dict()
+    sd = _strip_num_batches(_remap_compiled_keys(sd))
+    torch.save(sd, path)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ──────────────────────────────────────────────────────────────────────────────
+STRUCT_DIR = "/home/melhachimi/RP/3D-Voronoi/Inverse-Design/STRUCTURES"
+RF_DIR     = "/home/melhachimi/RP/3D-Voronoi/Inverse-Design/Reaction-Forces"
+SAVE_DIR   = "/home/melhachimi/RP/3D-Voronoi/Inverse-Design/"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PERFORMANCE KNOBS (2-a … 2-g)
+# ──────────────────────────────────────────────────────────────────────────────
+# 2-a) DataLoader throughput
+NUM_WORKERS = min(8, os.cpu_count() or 8)
+PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 4
+
+# 2-b) Fast math + cuDNN autotune
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("medium")  # PyTorch 2.x
+except Exception:
+    pass
+
+# 2-c) AMP + gradient accumulation
+USE_AMP = True          # autocast + GradScaler
+ACCUM_STEPS = 1         # set to 2 or 4 to grow effective batch size without more VRAM
+
+# 2-e) Auto LR scaling with batch size (scale rule)
+AUTO_SCALE_LR = True
+BASE_LR_PER_32 = 4e-4   # this is the LR you want when batch_size == 32
+
+# 2-f) Fewer epochs since each is now longer with more data (default 400)
+DEFAULT_EPOCHS = 500
+
+# 2-g) Use torch.compile if available
+USE_TORCH_COMPILE = True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODEL BLOCKS
+# ──────────────────────────────────────────────────────────────────────────────
+class ResidualConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, is_res: bool = False) -> None:
+        super().__init__()
+        self.same_channels = in_channels == out_channels
+        self.is_res = is_res
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, 1, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.is_res:
+            x1 = self.conv1(x)
+            x2 = self.conv2(x1)
+            out = x + x2 if self.same_channels else x1 + x2
+            return out / 1.414
+        else:
+            x1 = self.conv1(x)
+            x2 = self.conv2(x1)
+            return x2
+
+class UnetDown(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UnetDown, self).__init__()
+        self.model = nn.Sequential(
+            ResidualConvBlock(in_channels, out_channels),
+            nn.MaxPool2d(2)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+class UnetUp(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UnetUp, self).__init__()
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, 2, 2),
+            ResidualConvBlock(out_channels, out_channels),
+            ResidualConvBlock(out_channels, out_channels),
+        )
+    def forward(self, x, skip):
+        x = torch.cat((x, skip), 1)
+        return self.model(x)
+
+class EmbedFC(nn.Module):
+    def __init__(self, input_dim, emb_dim):
+        super(EmbedFC, self).__init__()
+        self.input_dim = input_dim
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+    def forward(self, x):
+        x = x.view(-1, self.input_dim)
+        return self.model(x)
+
+class ContextUnet(nn.Module):
+    """
+    Size-aware U-Net: bottleneck pool/upsample scales are derived from image size.
+    Expect square inputs (we pad to 32×32).
+    """
+    def __init__(self, in_channels, img_size: int, n_feat=256, n_classes=11):
+        super(ContextUnet, self).__init__()
+        assert img_size % 4 == 0, "img_size must be divisible by 4 (we downsample twice)."
+        self.in_channels = in_channels
+        self.n_feat = n_feat
+        self.n_classes = n_classes
+        self.img_size = img_size
+        self.bottleneck_spatial = img_size // 4  # after two MaxPool(2)
+
+        self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
+        self.down1 = UnetDown(n_feat, n_feat)
+        self.down2 = UnetDown(n_feat, 2 * n_feat)
+
+        #  ↓ from (B,2n, h/4, w/4) → (B,2n,1,1)
+        self.to_vec = nn.AdaptiveAvgPool2d(1)
+
+        self.timeembed1 = EmbedFC(1, 2*n_feat)
+        self.timeembed2 = EmbedFC(1, 1*n_feat)
+        self.contextembed1 = EmbedFC(n_classes, 2*n_feat)
+        self.contextembed2 = EmbedFC(n_classes, 1*n_feat)
+
+        #  ↑ from (B,2n,1,1) → (B,2n, h/4, w/4)
+        self.up0 = nn.Sequential(
+            nn.ConvTranspose2d(2 * n_feat, 2 * n_feat,
+                               kernel_size=self.bottleneck_spatial,
+                               stride=self.bottleneck_spatial),
+            nn.GroupNorm(8, 2 * n_feat),
+            nn.ReLU(),
+        )
+
+        self.up1 = UnetUp(4 * n_feat, n_feat)
+        self.up2 = UnetUp(2 * n_feat, n_feat)
+        self.out = nn.Sequential(
+            nn.Conv2d(2 * n_feat, n_feat, 3, 1, 1),
+            nn.GroupNorm(8, n_feat),
+            nn.ReLU(),
+            nn.Conv2d(n_feat, self.in_channels, 3, 1, 1),
+        )
+
+    def forward(self, x, c, t, context_mask):
+        x0 = self.init_conv(x)
+        d1 = self.down1(x0)     # /2
+        d2 = self.down2(d1)     # /4
+        hvec = self.to_vec(d2)  # 1×1
+
+        c = c * context_mask.unsqueeze(1).unsqueeze(2)
+
+        cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
+        temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
+        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
+        temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
+
+        u1 = self.up0(hvec)
+        u2 = self.up1(cemb1 * u1 + temb1, d2)
+        u3 = self.up2(cemb2 * u2 + temb2, d1)
+        out = self.out(torch.cat((u3, x0), 1))
+        return out
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DDPM schedules and wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+def ddpm_schedules(beta1, beta2, T):
+    assert beta1 < beta2 < 1.0
+    beta_t = (beta2 - beta1) * torch.arange(0, T + 1, dtype=torch.float32) / T + beta1
+    sqrt_beta_t = torch.sqrt(beta_t)
+    alpha_t = 1 - beta_t
+    log_alpha_t = torch.log(alpha_t)
+    alphabar_t = torch.cumsum(log_alpha_t, dim=0).exp()
+    sqrtab = torch.sqrt(alphabar_t)
+    oneover_sqrta = 1 / torch.sqrt(alpha_t)
+    sqrtmab = torch.sqrt(1 - alphabar_t)
+    mab_over_sqrtmab_inv = (1 - alpha_t) / sqrtmab
+    return {
+        "alpha_t": alpha_t,
+        "oneover_sqrta": oneover_sqrta,
+        "sqrt_beta_t": sqrt_beta_t,
+        "alphabar_t": alphabar_t,
+        "sqrtab": sqrtab,
+        "sqrtmab": sqrtmab,
+        "mab_over_sqrtmab": mab_over_sqrtmab_inv,
+    }
+
+class DDPM(nn.Module):
+    def __init__(self, nn_model, betas, n_T, device, drop_prob=0.1):
+        super(DDPM, self).__init__()
+        self.nn_model = nn_model.to(device)
+        for k, v in ddpm_schedules(betas[0], betas[1], n_T).items():
+            self.register_buffer(k, v)
+        self.n_T = n_T
+        self.device = device
+        self.drop_prob = drop_prob
+        self.loss_mse = nn.MSELoss()
+
+    def forward(self, x, c):
+        _ts = torch.randint(1, self.n_T + 1, (x.shape[0],), device=self.device)
+        noise = torch.randn_like(x)
+        x_t = (
+            self.sqrtab[_ts, None, None, None] * x
+            + self.sqrtmab[_ts, None, None, None] * noise
+        )
+        context_mask = torch.bernoulli(
+            torch.zeros(c.shape[0], device=self.device) + (1 - self.drop_prob)
+        )
+        return self.loss_mse(noise, self.nn_model(x_t, c, _ts / self.n_T, context_mask))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DATASET
+# ──────────────────────────────────────────────────────────────────────────────
+class VoronoiNewDataset(Dataset):
+    """
+    - Loads NPY structures of shape (25, 3), values in [0,50]
+      -> normalize to [0,1] by /50
+      -> pad to (32,32) in the top-left corner
+    - Loads CSV labels with a single column of length 11
+    """
+    def __init__(
+        self,
+        folder_input,
+        folder_label,
+        image_size=(32, 32),
+        exts=('npy',),
+        train_ratio=0.9,
+        training=True,
+        shuffle=True
+    ):
+        super().__init__()
+        self.folder_input = folder_input
+        self.folder_csv = folder_label
+        self.image_size = image_size
+
+        self.paths_input = []
+        for ext in exts:
+            self.paths_input.extend(Path(folder_input).glob(f"**/*.{ext}"))
+        self.paths_input = natsort.natsorted(self.paths_input)
+
+        self.paths_rxn = natsort.natsorted(Path(folder_label).glob("**/*.csv"))
+
+        assert len(self.paths_input) == len(self.paths_rxn), \
+            f"Mismatch: {len(self.paths_input)} structures vs {len(self.paths_rxn)} CSVs."
+
+        if shuffle:
+            random.seed(0)
+            paired = list(zip(self.paths_input, self.paths_rxn))
+            random.shuffle(paired)
+            self.paths_input, self.paths_rxn = map(list, zip(*paired))
+
+        self.training = training
+        self.train_ratio = train_ratio
+
+        if 0.0 < train_ratio < 1.0:
+            n_train = int(len(self.paths_input) * train_ratio)
+            if self.training:
+                self.paths_input = self.paths_input[:n_train]
+                self.paths_rxn   = self.paths_rxn[:n_train]
+            else:
+                self.paths_input = self.paths_input[n_train:]
+                self.paths_rxn   = self.paths_rxn[n_train:]
+
+        self.transform_img = T.Compose([T.ToTensor()])  # (H,W) -> (1,H,W)
+
+    @staticmethod
+    def _pad_to_square(x: np.ndarray, target: int = 32) -> np.ndarray:
+        H, W = x.shape
+        out = np.zeros((target, target), dtype=np.float32)
+        out[:H, :W] = x
+        return out
+
+    def __len__(self):
+        return len(self.paths_input)
+
+    def __getitem__(self, index):
+        npy_path = self.paths_input[index]
+        csv_path = self.paths_rxn[index]
+
+        arr = np.load(npy_path).astype(np.float32)  # expected shape (25,3)
+        assert arr.ndim == 2 and arr.shape == (25, 3), f"Bad shape in {npy_path}: {arr.shape}"
+        arr = np.clip(arr, 0.0, 50.0) / 50.0
+        img = self._pad_to_square(arr, target=self.image_size[0])  # 32×32
+
+        rf = pd.read_csv(csv_path, header=None).values.squeeze().astype(np.float32)
+        assert rf.ndim == 1 and rf.shape[0] == 11, f"CSV {csv_path} must be 11x1"
+        label = rf[np.newaxis, :]  # (1,11)
+
+        return self.transform_img(img), torch.from_numpy(label), npy_path.name
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST PASS: export predictions for the held-out 10%
+# Saves:
+#   1) /.../Predicted-Structures-npy-32-32/Predicted-Structure-%d.npy   (32×32, [0,1])
+#   2) /.../Predicted-Structures-npy-25-3/Predicted-Structure-%d.npy    (25×3, scaled to [0,50])
+#   3) /.../Predicted-Structures-txt/Predicted-Structure-%d.txt         (25×3, scaled to [0,50])
+# where %d matches the original sample id (e.g., structure-123.npy → 123)
+# ──────────────────────────────────────────────────────────────────────────────
+import re
+
+@torch.no_grad()
+def export_test_set_predictions_full(
+    guide_w: float = 0.5,
+    n_T: int = 1000,
+    img_size: int = 32,
+    device: str | None = None,
+    model_ckpt: str = os.path.join(SAVE_DIR, "best_model_3D.pth"),
+    base_out_dir: str = SAVE_DIR
+):
+    if device is None:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    # Build the *test* split (last 10% after fixed shuffle(seed=0))
+    dset_test = VoronoiNewDataset(
+        folder_input=STRUCT_DIR,
+        folder_label=RF_DIR,
+        image_size=(img_size, img_size),
+        train_ratio=0.9,
+        training=False,   # <-- held-out 10%
+        shuffle=True      # deterministic due to random.seed(0) in the dataset
+    )
+    print(f"[INFO] Test set size: {len(dset_test)} samples")
+
+    # Output dirs
+    out_dir_32 = os.path.join(base_out_dir, "Predicted-Structures-npy-32-32")
+    out_dir_25 = os.path.join(base_out_dir, "Predicted-Structures-npy-25-3")
+    out_dir_txt = os.path.join(base_out_dir, "Predicted-Structures-txt")
+    for d in [out_dir_32, out_dir_25, out_dir_txt]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+
+    # Load model from checkpoint
+    model = ContextUnet(in_channels=1, img_size=img_size, n_feat=128, n_classes=11)
+    ddpm  = DDPM(model, betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=0.1)
+    smart_load_ddpm(ddpm, model_ckpt, map_location=device, strict=True)
+    ddpm.to(device).eval()
+    ddpm = ddpm.to(memory_format=torch.channels_last)
+
+    for idx in range(len(dset_test)):
+        # Get condition (RF) and the paired structure filename
+        _, label_tensor, npy_name = dset_test[idx]      # label_tensor: (1,11)
+        cond = label_tensor.squeeze(0).to(device)       # (11,)
+        stem = Path(npy_name).stem                      # e.g. 'structure-123'
+        # Extract numeric id to preserve naming convention
+        m = re.search(r"(\d+)$", stem)
+        sample_id = int(m.group(1)) if m else idx
+
+        # CFG sampling: make unconditional (mask=0) & conditional (mask=1) pair
+        n_sample = 1
+        x_i = torch.randn(n_sample, 1, img_size, img_size, device=device).to(memory_format=torch.channels_last)
+        c_i = cond.unsqueeze(0).repeat(2, 1).unsqueeze(1)  # (2,1,11)
+        context_mask = torch.zeros(2, device=device)
+        context_mask[n_sample:] = 1.0  # first = uncond (0), second = cond (1)
+
+        for t in range(ddpm.n_T, 0, -1):
+            t_is = torch.full((n_sample, 1, 1, 1), t / ddpm.n_T, device=device)
+            x_rep = x_i.repeat(2, 1, 1, 1)
+            t_rep = t_is.repeat(2, 1, 1, 1)
+            z = torch.randn_like(x_i) if t > 1 else 0
+
+            eps = ddpm.nn_model(x_rep, c_i, t_rep, context_mask)
+            eps_uncond, eps_cond = eps[:n_sample], eps[n_sample:]
+            eps_guided = (1 + guide_w) * eps_cond - guide_w * eps_uncond
+
+            x_i = ddpm.oneover_sqrta[t] * (x_i - eps_guided * ddpm.mab_over_sqrtmab[t]) + ddpm.sqrt_beta_t[t] * z
+
+        # Post-process:
+        #   - full image (32×32) in [0,1]
+        #   - crop 25×3 and scale back to [0,50] (inverse of training’s /50 padding)
+        img32 = x_i.squeeze(0).squeeze(0).clamp(0, 1).cpu().numpy()     # (32,32), float32
+        coords_25x3 = (img32[:25, :3] * 50.0).astype(np.float32)        # (25,3)
+
+        # Save with requested names/locations
+        np.save(os.path.join(out_dir_32, f"Predicted-Structure-{sample_id}.npy"), img32.astype(np.float32))
+        np.save(os.path.join(out_dir_25, f"Predicted-Structure-{sample_id}.npy"), coords_25x3)
+        np.savetxt(os.path.join(out_dir_txt, f"Predicted-Structure-{sample_id}.txt"), coords_25x3, fmt="%.6f")
+
+        print(f"[TEST] {idx+1:03d}/{len(dset_test)} → Predicted-Structure-{sample_id}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EVALUATE ONE SAMPLE (saves cropped 25x3 TXT)
+# ──────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def evaluate_one_sample(
+    sample_idx: int = 0,
+    guide_w: float = 0.5,
+    n_T: int = 1000,
+    img_size: int = 32,
+    device: str | None = None,
+    out_dir: str = SAVE_DIR,
+    model_ckpt: str = os.path.join(SAVE_DIR, "best_model_3D.pth"),
+):
+    if device is None:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    dset = VoronoiNewDataset(
+        folder_input=STRUCT_DIR,
+        folder_label=RF_DIR,
+        image_size=(img_size, img_size),
+        train_ratio=1.0,    # use all available samples
+        training=True,
+        shuffle=False
+    )
+    assert 0 <= sample_idx < len(dset), f"sample_idx must be in [0, {len(dset)-1}]"
+
+    _, label_tensor, npy_name = dset[sample_idx]          # label_tensor: (1,11)
+    cond = label_tensor.squeeze(0).to(device)             # (11,)
+    stem = Path(npy_name).stem
+
+    model = ContextUnet(in_channels=1, img_size=img_size, n_feat=128, n_classes=11)
+    ddpm  = DDPM(model, betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=0.1)
+    smart_load_ddpm(ddpm, model_ckpt, map_location=device, strict=True)
+    ddpm.to(device)
+    ddpm = ddpm.to(memory_format=torch.channels_last)  # 2-d) channels-last
+    ddpm.eval()
+
+    # CFG: batch=1 duplicated to 2
+    n_sample = 1
+    x_i = torch.randn(n_sample, 1, img_size, img_size, device=device).to(memory_format=torch.channels_last)
+
+    c_i = cond.unsqueeze(0)                # (1,11)
+    c_i = c_i.repeat(2, 1).unsqueeze(1)    # (2,1,11)
+    context_mask = torch.zeros(2, device=device)
+    context_mask[n_sample:] = 1.0
+
+    for i in range(ddpm.n_T, 0, -1):
+        t_is = torch.full((n_sample, 1, 1, 1), i / ddpm.n_T, device=device)
+        x_rep = x_i.repeat(2, 1, 1, 1)
+        t_rep = t_is.repeat(2, 1, 1, 1)
+        z = torch.randn_like(x_i) if i > 1 else 0
+
+        eps = ddpm.nn_model(x_rep, c_i, t_rep, context_mask)
+        eps1, eps2 = eps[:n_sample], eps[n_sample:]
+        eps_guided = (1 + guide_w) * eps2 - guide_w * eps1
+
+        x_i = ddpm.oneover_sqrta[i] * (x_i - eps_guided * ddpm.mab_over_sqrtmab[i]) + ddpm.sqrt_beta_t[i] * z
+
+    out_np = x_i.squeeze(0).squeeze(0).clamp(0, 1).cpu().numpy()  # (32,32)
+    crop = out_np[:25, :3] * 50.0
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    out_txt = os.path.join(out_dir, f"pred_{stem}_25x3.txt")
+    np.savetxt(out_txt, crop, fmt="%.6f")
+
+    print(f"[OK] Saved predicted 25x3 TXT to: {out_txt}")
+    return out_txt
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TRAINING (with 2-a … 2-g integrated)
+# ──────────────────────────────────────────────────────────────────────────────
+def train_inverse_design_new(
+    n_epoch: int = DEFAULT_EPOCHS,
+    batch_size: int = 32,
+    n_T: int = 1000,
+    device: str = "cuda:0",
+    n_classes: int = 11,
+    n_feat: int = 128,
+    base_lr: float | None = None,   # if None and AUTO_SCALE_LR True → computed
+    warm_epochs: int = 10,
+    weight_decay: float = 1e-2,
+    grad_clip: float = 1.0,
+    save_model: bool = True,
+    drop_prob: float = 0.2,
+    img_size: int = 32
+):
+    """
+    Trains a conditional DDPM:
+      input condition = 11-D reaction-force vector
+      output image    = 1×32×32 (padded from 25×3)
+    """
+    # dynamic LR scaling (2-e)
+    effective_lr = base_lr
+    if AUTO_SCALE_LR:
+        # Use linear scaling based on batch_size; default anchor is 32 → BASE_LR_PER_32
+        effective_lr = BASE_LR_PER_32 * (batch_size / 32.0) if base_lr is None else base_lr
+    else:
+        effective_lr = BASE_LR_PER_32 if base_lr is None else base_lr
+
+    # model
+    model = ContextUnet(in_channels=1, img_size=img_size, n_feat=n_feat, n_classes=n_classes)
+    if USE_TORCH_COMPILE:
+        try:
+            model = torch.compile(model, mode="default")  # or "reduce-overhead"
+        except Exception:
+            pass
+
+
+    ddpm = DDPM(nn_model=model, betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=drop_prob).to(device)
+    ddpm = ddpm.to(memory_format=torch.channels_last)  # 2-d
+
+    # data
+    trainset = VoronoiNewDataset(
+        folder_input=STRUCT_DIR,
+        folder_label=RF_DIR,
+        image_size=(img_size, img_size),
+        train_ratio=0.9,
+        training=True,
+        shuffle=True
+    )
+
+    # DataLoader with 2-a options (guard for workers==0)
+    dl_kwargs = dict(batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=NUM_WORKERS)
+    if NUM_WORKERS > 0:
+        dl_kwargs.update(dict(persistent_workers=PERSISTENT_WORKERS, prefetch_factor=PREFETCH_FACTOR))
+    traindata = DataLoader(trainset, **dl_kwargs)
+
+    # optimizer & scheduler
+    optim = torch.optim.AdamW(ddpm.parameters(), lr=effective_lr, weight_decay=weight_decay, betas=(0.9, 0.95))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=n_epoch - warm_epochs)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)  # 2-c
+
+    best_loss, loss_hist = float("inf"), []
+    t0 = time.time()
+
+    for ep in range(n_epoch):
+        ddpm.train()
+        print(f"epoch {ep:03d}")
+
+        # warm-up
+        if ep < warm_epochs:
+            curr_lr = effective_lr * (ep + 1) / max(1, warm_epochs)
+            for pg in optim.param_groups:
+                pg["lr"] = curr_lr
+
+        pbar = tqdm(traindata, leave=False)
+        ema, per_iter = None, []
+
+        optim.zero_grad(set_to_none=True)
+        for it, (x, c, _) in enumerate(pbar, start=1):
+            # channels-last tensors (2-d)
+            x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            c = c.to(device, non_blocking=True)
+
+            with torch.amp.autocast("cuda", enabled=USE_AMP):  # 2-c
+                loss = ddpm(x, c) / ACCUM_STEPS
+
+            scaler.scale(loss).backward()
+
+            if it % ACCUM_STEPS == 0:
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(ddpm.parameters(), grad_clip)
+                scaler.step(optim)
+                scaler.update()
+                optim.zero_grad(set_to_none=True)
+
+            cur = loss.item() * ACCUM_STEPS
+            ema = cur if ema is None else 0.95 * ema + 0.05 * cur
+            pbar.set_description(f"loss: {ema:.4f}")
+            per_iter.append(ema)
+
+        loss_ep = float(np.mean(per_iter))
+        loss_hist.append(loss_ep)
+
+        if ep >= warm_epochs:
+            scheduler.step()
+
+        # save best
+        if loss_ep < best_loss:
+            best_loss = loss_ep
+            Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
+            save_ddpm_unwrapped(ddpm, os.path.join(SAVE_DIR, "best_model_3D.pth"))
+            print(f"  ↳ new best - saved to best_model_3D.pth  (loss {best_loss:.4f})")
+
+        if save_model and ep == n_epoch - 1:
+            save_ddpm_unwrapped(ddpm, os.path.join(SAVE_DIR, f"model_3D_{ep}.pth"))
+            print("  ↳ final model saved")
+
+    print(f"Total training time: {time.time() - t0:.1f} s")
+
+    # loss curve
+    plt.figure()
+    plt.plot(loss_hist)
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Training loss (new case)")
+    Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
+    plt.savefig(os.path.join(SAVE_DIR, "3D_loss.png"))
+    plt.close()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# QUICK SAMPLER (optional visual check)
+# ──────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def quick_sample_new(n_sample=8, device="cuda:0", img_size=32, guide_w=0.5):
+    model = ContextUnet(in_channels=1, img_size=img_size, n_feat=128, n_classes=11)
+    ddpm = DDPM(model, betas=(1e-4, 0.02), n_T=1000, device=device, drop_prob=0.1)
+    ddpm.load_state_dict(torch.load(os.path.join(SAVE_DIR, "best_model_3D.pth"), map_location=device))
+    ddpm.to(device)
+    ddpm = ddpm.to(memory_format=torch.channels_last)  # 2-d
+    ddpm.eval()
+
+    dset = VoronoiNewDataset(STRUCT_DIR, RF_DIR, image_size=(img_size, img_size), train_ratio=1.0, training=True, shuffle=True)
+    idx = torch.randint(0, len(dset), (n_sample,))
+    cond = torch.stack([dset[i][1].squeeze(0) for i in idx], dim=0).to(device)  # (N,11)
+
+    x_i = torch.randn(n_sample, 1, img_size, img_size, device=device).to(memory_format=torch.channels_last)
+
+    c_i = cond.repeat(2, 1).unsqueeze(1)  # (2N,1,11)
+    context_mask = torch.zeros(c_i.shape[0], device=device)
+    context_mask[n_sample:] = 1.0
+
+    for i in range(ddpm.n_T, 0, -1):
+        t_is = torch.full((n_sample, 1, 1, 1), i / ddpm.n_T, device=device)
+        x_i = x_i.repeat(2, 1, 1, 1)
+        t_is = t_is.repeat(2, 1, 1, 1)
+        z = torch.randn_like(x_i[:n_sample]) if i > 1 else 0
+
+        eps = ddpm.nn_model(x_i, c_i, t_is, context_mask)
+        eps1, eps2 = eps[:n_sample], eps[n_sample:]
+        eps = (1 + guide_w) * eps2 - guide_w * eps1
+        x_i = x_i[:n_sample]
+        x_i = ddpm.oneover_sqrta[i] * (x_i - eps * ddpm.mab_over_sqrtmab[i]) + ddpm.sqrt_beta_t[i] * z
+
+    grid = make_grid(x_i.clamp(0, 1), nrow=n_sample)
+    save_image(grid, os.path.join(SAVE_DIR, f"Sampling_new_w{guide_w}.png"))
+    print("Saved sampler grid.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # Train on the (now larger) dataset
+    train_inverse_design_new(
+        n_epoch=DEFAULT_EPOCHS,   # 2-f
+        batch_size=32,            # bump to 64 if VRAM allows; LR scales automatically (2-e)
+        n_T=1000,
+        device="cuda:0",
+        n_classes=11,
+        n_feat=128,
+        base_lr=None,             # None → auto-compute via (2-e)
+        warm_epochs=10,
+        weight_decay=1e-2,
+        grad_clip=1.0,
+        save_model=True,
+        drop_prob=0.2,
+        img_size=32
+    )
+    export_test_set_predictions_full(
+        guide_w=0.5,        # tweak if you like (0.3–1.5 common)
+        n_T=1000,
+        img_size=32,
+        device="cuda:0",
+        model_ckpt=os.path.join(SAVE_DIR, "best_model_3D.pth"),
+        base_out_dir=SAVE_DIR
+    )
